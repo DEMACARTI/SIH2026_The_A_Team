@@ -1,0 +1,132 @@
+:root {
+  --bg-deep: #060a10;
+  --bg-panel: #0d141c;
+  --bg-panel-alt: #101922;
+  --bg-inset: #080d13;
+  --border: #1c2a35;
+  --border-bright: #2c4048;
+  --cyan: #3ed6c7;
+  --cyan-dim: #1f6e68;
+  --cyan-faint: rgba(62, 214, 199, 0.16);
+  --amber: #f0a94e;
+  --amber-dim: #8a611f;
+  --amber-faint: rgba(240, 169, 78, 0.16);
+  --text: #e7eef2;
+  --text-muted: #7c93a1;
+  --text-faint: #44586a;
+  --danger: #e2584b;
+  --danger-faint: rgba(226, 88, 75, 0.14);
+
+  --sans: 'IBM Plex Sans', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+  --radius: 2px;
+  --gutter: 20px;
+
+  color-scheme: dark;
+}
+
+@media (max-width: 767px) {
+  :root {
+    --gutter: 12px;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--cyan-dim);
+}
+
+/* Thin, console-style scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) transparent;
+}
+
+/* Value-change flash on readouts — disabled for reduced motion below. */
+@keyframes flash {
+  from {
+    background: rgba(231, 238, 242, 0.1);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+@keyframes glow-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

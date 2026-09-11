@@ -1,0 +1,5 @@
+node_modules/
+dist/
+firmware/.pio/
+.DS_Store
+*.log
