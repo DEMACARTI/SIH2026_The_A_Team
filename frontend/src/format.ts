@@ -16,7 +16,13 @@ export function fmtAgo(ms: number | null | undefined): string {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
-export const waveformLabel = (w: Waveform | undefined) => (w === 'CW_PULSE' ? 'CW pulse' : w === 'LFM_CHIRP' ? 'LFM chirp' : '—');
+const WAVEFORM_LABELS: Record<Waveform, string> = {
+  LFM_CHIRP: 'LFM chirp',
+  CW_PULSE: 'CW pulse',
+  GEOMETRIC_SWEEP: 'Geometric sweep',
+  PHASE_CODED: 'Phase-coded',
+};
+export const waveformLabel = (w: Waveform | undefined) => (w ? WAVEFORM_LABELS[w] ?? w : '—');
 
 export const SOURCE_LABEL: Record<Source, string> = { serial: 'USB', wifi: 'WiFi', simulated: 'SIM' };
 

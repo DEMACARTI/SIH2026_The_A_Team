@@ -87,6 +87,9 @@ export class SonarSimulator {
       case 'trigger_ping':
         this.pingRequested = true;
         return 'ping requested — jumping to TRANSMIT';
+      case 'set_waveform_mode':
+        this.params.waveform = c.value;
+        return `waveform forced → ${c.value}`;
     }
   }
 

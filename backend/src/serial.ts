@@ -5,6 +5,7 @@
  * `reconnecting` and the same port is re-opened as soon as it reappears.
  */
 import { EventEmitter } from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
 import { SerialPort } from 'serialport';
 
 export type SerialState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
@@ -39,7 +40,7 @@ type SerialEvents = {
   change: [];
 };
 
-const MAX_LINE = 4096;
+const MAX_LINE = 16384; // generous headroom for a telemetry line carrying both a waveform capture and a spectrogram
 const RETRY_MS = 2000;
 const SILENT_MS = 3000;
 const WARN_INTERVAL_MS = 2000;
@@ -49,6 +50,9 @@ const ESP32_VENDORS = new Set(['10c4', '1a86', '303a', '0403']);
 export class SerialManager extends EventEmitter<SerialEvents> {
   private port: SerialPort | null = null;
   private buf = '';
+  // A multi-byte UTF-8 char (e.g. an em dash in a device log line) can land split across two
+  // USB reads; StringDecoder holds the incomplete tail back instead of corrupting it into U+FFFD.
+  private decoder = new StringDecoder('utf8');
   private state: SerialState = 'disconnected';
   private path: string | null = null;
   private baudRate: number | null = null;
@@ -155,6 +159,7 @@ export class SerialManager extends EventEmitter<SerialEvents> {
         if (err) return reject(err);
         this.port = port;
         this.buf = '';
+        this.decoder = new StringDecoder('utf8');
         this.openedAt = Date.now();
         this.silent = false;
         port.on('data', (chunk: Buffer) => this.onData(chunk));
@@ -171,7 +176,7 @@ export class SerialManager extends EventEmitter<SerialEvents> {
   }
 
   private onData(chunk: Buffer): void {
-    this.buf += chunk.toString('utf8');
+    this.buf += this.decoder.write(chunk);
     let nl: number;
     while ((nl = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, nl).trim();
@@ -180,6 +185,7 @@ export class SerialManager extends EventEmitter<SerialEvents> {
     }
     if (this.buf.length > MAX_LINE) {
       this.buf = '';
+      this.decoder = new StringDecoder('utf8');
       this.invalidLines += 1;
       this.warnThrottled(`serial: discarded ${MAX_LINE}+ bytes with no newline — wrong baud rate?`);
     }

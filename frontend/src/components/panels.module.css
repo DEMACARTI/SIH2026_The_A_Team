@@ -168,6 +168,78 @@
   }
 }
 
+/* ---------- Waveform formation (computed sweep/phase shape) ---------- */
+.formation {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.formationHead {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.formationSvg {
+  display: block;
+  width: 100%;
+  height: 60px;
+}
+
+.formationAxis {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
+/* ---------- Spectrogram ---------- */
+.spectrogramWrap {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.spectrogramCanvas {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  height: 90px;
+  display: block;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+  background: var(--bg-inset);
+}
+
+.spectrogramYAxis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  width: 34px;
+  text-align: right;
+}
+
+.spectrogramXAxis {
+  display: flex;
+  justify-content: space-between;
+  margin-left: 0;
+  padding-right: 40px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
 /* ---------- Channels ---------- */
 .channels {
   display: flex;
@@ -202,6 +274,74 @@
   .channel {
     padding: 6px 8px;
   }
+}
+
+/* ---------- Fuzzy mode selection ---------- */
+.fuzzyGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.fuzzyGroup:last-child {
+  margin-bottom: 0;
+}
+
+.fuzzyBar {
+  display: grid;
+  grid-template-columns: 46px 1fr 34px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.fuzzyBarLabel {
+  color: var(--text-muted);
+  text-transform: capitalize;
+}
+
+.fuzzyBarTrack {
+  height: 6px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.fuzzyBarFill {
+  height: 100%;
+  transition: width 0.3s ease-out, background 0.3s;
+}
+
+.fuzzyBarValue {
+  color: var(--text);
+  text-align: right;
+}
+
+/* ---------- Fuzzy membership curves ---------- */
+.membershipChart {
+  margin-bottom: 10px;
+}
+
+.membershipChart:last-child {
+  margin-bottom: 0;
+}
+
+.membershipHead {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.membershipSvg {
+  display: block;
+  width: 100%;
+  height: 76px;
 }
 
 /* ---------- Ping history table ---------- */
@@ -333,6 +473,16 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 8px 14px;
+}
+
+.modeButtons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.modeButtons button {
+  flex: 1 1 auto;
 }
 
 .slider {

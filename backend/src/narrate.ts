@@ -21,18 +21,31 @@ export interface LogEntry {
   source?: Source;
 }
 
-const waveformLabel = (w: Telemetry['waveform']) => (w === 'LFM_CHIRP' ? 'LFM chirp' : 'CW pulse');
+const WAVEFORM_LABEL: Record<string, string> = {
+  LFM_CHIRP: 'LFM chirp',
+  CW_PULSE: 'CW pulse',
+  GEOMETRIC_SWEEP: 'geometric sweep',
+  PHASE_CODED: 'phase-coded',
+};
+const waveformLabel = (w: Telemetry['waveform']) => WAVEFORM_LABEL[w] ?? w;
 
 export function narrate(prev: Telemetry | null, cur: Telemetry, mode: Mode): { tag: LogTag; text: string } | null {
   switch (cur.state) {
     case 'IDLE':
       return cur.log ? { tag: 'SYS', text: cur.log } : null;
-    case 'TRANSMIT':
+    case 'TRANSMIT': {
+      if (cur.log) return { tag: 'TX', text: cur.log };
+      // Real TX-only hardware: gain_db is an amplitude scale, not literal dB — phrase it as "amp".
+      const gainPart = cur.rx_available === false ? `amp=${cur.gain_db.toFixed(0)}` : `gain=${cur.gain_db.toFixed(0)}dB`;
+      const samplesPart = cur.waveform_samples?.length
+        ? `, ${cur.waveform_samples.length} samples${cur.sample_rate_hz ? ` @ ${(cur.sample_rate_hz / 1000).toFixed(0)}kHz` : ''} captured`
+        : '';
       return {
         tag: 'TX',
-        text: cur.log ?? `ping #${cur.cycle} — ${cur.frequency_khz}kHz ${waveformLabel(cur.waveform)}, ` +
-          `pulse=${cur.pulse_width_ms.toFixed(1)}ms, gain=${cur.gain_db.toFixed(0)}dB`,
+        text: `ping #${cur.cycle} — ${cur.frequency_khz}kHz ${waveformLabel(cur.waveform)}, ` +
+          `pulse=${cur.pulse_width_ms.toFixed(1)}ms, ${gainPart}${samplesPart}`,
       };
+    }
     case 'LISTEN':
       return {
         tag: 'RX',
@@ -48,9 +61,25 @@ export function narrate(prev: Telemetry | null, cur: Telemetry, mode: Mode): { t
     case 'ADAPT': {
       const tag: LogTag = mode === 'manual' ? 'MANUAL' : 'ADAPT';
       if (cur.log) return { tag, text: cur.log };
+      if (cur.fuzzy) return { tag, text: inferAdaptReasonFuzzy(cur) };
       return { tag, text: inferAdaptReason(prev, cur) };
     }
   }
+}
+
+/** Fuzzy-driven reasoning for the real TX-only hardware — no SNR feedback loop exists on it. */
+function inferAdaptReasonFuzzy(cur: Telemetry): string {
+  const f = cur.fuzzy!;
+  const dominant = (label: string, m: { low: number; med: number; high: number } | { cold: number; normal: number; warm: number }) => {
+    const entries = Object.entries(m) as [string, number][];
+    const [name, value] = entries.reduce((a, b) => (b[1] > a[1] ? b : a));
+    return `${label} ${name} (${value.toFixed(2)})`;
+  };
+  const scores = f.scores;
+  const winner = (Object.entries(scores) as [string, number][]).reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+  const winnerLabel = winner === 'lfm' ? 'LFM chirp' : winner === 'geo' ? 'geometric sweep' : 'phase-coded';
+  return `${dominant('turbidity', f.turbidity)}, ${dominant('depth', f.depth)}, ${dominant('temp', f.temperature)} ` +
+    `→ ${winnerLabel} [LFM ${scores.lfm.toFixed(2)}, Geo ${scores.geo.toFixed(2)}, Phase ${scores.phase.toFixed(2)}]`;
 }
 
 function inferAdaptReason(prev: Telemetry | null, cur: Telemetry): string {

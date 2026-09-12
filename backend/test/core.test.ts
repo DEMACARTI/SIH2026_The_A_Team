@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { CommandQueue } from '../src/commands.js';
 import { parseCommand, parseTelemetry, type Telemetry } from '../src/contract.js';
+import { FuzzySimulator } from '../src/fuzzy-simulator.js';
 import { TelemetryHub } from '../src/hub.js';
 import { narrate } from '../src/narrate.js';
 import { SonarSimulator } from '../src/simulator.js';
@@ -44,6 +45,68 @@ describe('contract', () => {
     const r = parseCommand({ cmd: 'set_params', frequency_khz: 31, pulse_width_ms: 9, gain_db: -3 });
     assert.ok(r.ok);
     assert.deepEqual(r.value, { cmd: 'set_params', frequency_khz: 30, pulse_width_ms: 5, gain_db: 0 });
+  });
+
+  it('validates set_waveform_mode, normalizing spelling like telemetry', () => {
+    const r = parseCommand({ cmd: 'set_waveform_mode', value: 'geometric sweep' });
+    assert.deepEqual(r, { ok: true, value: { cmd: 'set_waveform_mode', value: 'GEOMETRIC_SWEEP' } });
+    assert.equal(parseCommand({ cmd: 'set_waveform_mode', value: 'nonsense' }).ok, false);
+  });
+
+  const fuzzyReal = {
+    state: 'TRANSMIT' as const, cycle: 3, frequency_khz: 34, pulse_width_ms: 120, gain_db: 76,
+    waveform: 'PHASE_CODED' as const, timestamp_ms: 555, rx_available: false,
+    fuzzy: {
+      turbidity: { low: 0, med: 0.2, high: 0.8 }, depth: { low: 1, med: 0, high: 0 },
+      temperature: { cold: 0, normal: 1, warm: 0 }, scores: { lfm: 0.1, geo: 0.05, phase: 0.85 },
+    },
+    sensor_raw: { temp_adc: 2048, depth_adc: 512, turbidity_adc: 3800 },
+    waveform_samples: [128, 200, 60, 128],
+    sample_rate_hz: 160000, duration_ms: 120,
+  };
+
+  it('accepts real TX-only hardware telemetry: no RX fields, fuzzy + sensor + samples present', () => {
+    const r = parseTelemetry(fuzzyReal);
+    assert.ok(r.ok);
+    assert.equal(r.value.rx_available, false);
+    assert.equal(r.value.snr_db, 0);
+    assert.equal(r.value.target_present, false);
+    assert.deepEqual(r.value.fuzzy, fuzzyReal.fuzzy);
+    assert.deepEqual(r.value.sensor_raw, fuzzyReal.sensor_raw);
+    assert.deepEqual(r.value.waveform_samples, fuzzyReal.waveform_samples);
+  });
+
+  it('rejects RX-chain telemetry missing snr/noise/target unless rx_available is false', () => {
+    const { snr_db, noise_floor_db, target_present, target_range_m, ...noRx } = sample;
+    assert.equal(parseTelemetry(noRx).ok, false);
+    const r = parseTelemetry({ ...noRx, rx_available: false });
+    assert.ok(r.ok);
+    assert.equal(r.value.snr_db, 0);
+  });
+
+  it('drops a malformed fuzzy/sensor_raw/waveform_samples block instead of rejecting the whole message', () => {
+    const r = parseTelemetry({ ...sample, fuzzy: { turbidity: { low: 'nope' } }, sensor_raw: { temp_adc: 1 }, waveform_samples: ['x'] });
+    assert.ok(r.ok);
+    assert.equal(r.value.fuzzy, undefined);
+    assert.equal(r.value.sensor_raw, undefined);
+    assert.equal(r.value.waveform_samples, undefined);
+  });
+
+  it('accepts a spectrogram grid (from the ADC-loopback FFT monitor, once wired)', () => {
+    const grid = { freq_step_hz: 781.25, frame_step_ms: 8, frames: [[0, 10, 255], [1, 20, 200]] };
+    const r = parseTelemetry({ ...sample, spectrogram: grid });
+    assert.ok(r.ok);
+    assert.deepEqual(r.value.spectrogram, grid);
+  });
+
+  it('drops a spectrogram with jagged rows or an oversized grid instead of rejecting the message', () => {
+    const jagged = parseTelemetry({ ...sample, spectrogram: { freq_step_hz: 1, frame_step_ms: 1, frames: [[1, 2], [1]] } });
+    assert.ok(jagged.ok);
+    assert.equal(jagged.value.spectrogram, undefined);
+
+    const empty = parseTelemetry({ ...sample, spectrogram: { freq_step_hz: 1, frame_step_ms: 1, frames: [] } });
+    assert.ok(empty.ok);
+    assert.equal(empty.value.spectrogram, undefined);
   });
 });
 
@@ -110,6 +173,12 @@ describe('simulator adaptive rules', () => {
     sim.applyCommand({ cmd: 'trigger_ping' });
     assert.equal(sim.step().state, 'TRANSMIT');
   });
+
+  it('set_waveform_mode forces the waveform directly', () => {
+    const sim = new SonarSimulator();
+    sim.applyCommand({ cmd: 'set_waveform_mode', value: 'PHASE_CODED' });
+    assert.equal(sim.params.waveform, 'PHASE_CODED');
+  });
 });
 
 describe('narration', () => {
@@ -124,6 +193,43 @@ describe('narration', () => {
   it('uses device-supplied reasoning verbatim', () => {
     const line = narrate(null, { ...sample, state: 'ADAPT', log: 'custom reason' }, 'auto')!;
     assert.equal(line.text, 'custom reason');
+  });
+
+  it('narrates fuzzy mode selection for real TX-only hardware with no SNR loop', () => {
+    const cur = {
+      ...sample, state: 'ADAPT' as const, rx_available: false,
+      fuzzy: {
+        turbidity: { low: 0, med: 0.1, high: 0.9 }, depth: { low: 1, med: 0, high: 0 },
+        temperature: { cold: 0, normal: 1, warm: 0 }, scores: { lfm: 0.05, geo: 0.1, phase: 0.9 },
+      },
+    };
+    const line = narrate(null, cur, 'auto')!;
+    assert.equal(line.tag, 'ADAPT');
+    assert.match(line.text, /turbidity high \(0\.90\)/);
+    assert.match(line.text, /→ phase-coded \[LFM 0\.05, Geo 0\.10, Phase 0\.90\]/);
+  });
+});
+
+describe('fuzzy simulator (fake-device --fuzzy)', () => {
+  it('produces a well-formed telemetry frame that the real contract accepts', () => {
+    const sim = new FuzzySimulator();
+    const r = parseTelemetry(sim.step());
+    assert.ok(r.ok);
+    assert.equal(r.value.rx_available, false);
+  });
+
+  it('only attaches a spectrogram when explicitly asked, and it validates against the real contract', () => {
+    const sim = new FuzzySimulator();
+    const plain = parseTelemetry(sim.transmit(false));
+    assert.ok(plain.ok);
+    assert.equal(plain.value.spectrogram, undefined);
+
+    const withSpec = parseTelemetry(sim.transmit(true));
+    assert.ok(withSpec.ok);
+    assert.ok(withSpec.value.spectrogram);
+    assert.ok(withSpec.value.spectrogram!.frames.length > 0);
+    const binCount = withSpec.value.spectrogram!.frames[0].length;
+    assert.ok(withSpec.value.spectrogram!.frames.every((f) => f.length === binCount));
   });
 });
 

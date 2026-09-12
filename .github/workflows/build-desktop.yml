@@ -1,0 +1,51 @@
+# Builds the desktop app for Windows, macOS, and Linux.
+#
+# Why CI and not "just cross-compile from one machine": the app bundles a native
+# module (serialport) that must be compiled/fetched against each target OS+arch's
+# ABI. That only works reliably when actually run on that OS, so this workflow
+# builds each platform on its own runner rather than cross-compiling from one.
+#
+# Run manually from the Actions tab (workflow_dispatch), or automatically when
+# you push a version tag like v1.0.0. Unsigned builds: macOS will show an
+# "unidentified developer" warning and Windows may show a SmartScreen prompt —
+# expected without a paid code-signing certificate; see README.md.
+name: Build desktop app
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            script: electron:build:mac
+          - os: windows-latest
+            script: electron:build:win
+          - os: ubuntu-latest
+            script: electron:build:linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Linux runners need these to build the native serialport module.
+      - if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - run: npm ci
+      - run: npm run ${{ matrix.script }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonar-console-${{ matrix.os }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.deb
+          if-no-files-found: error

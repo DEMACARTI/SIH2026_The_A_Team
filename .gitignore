@@ -3,3 +3,4 @@ dist/
 firmware/.pio/
 .DS_Store
 *.log
+release/

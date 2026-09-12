@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Telemetry + visualization console for the adaptive sonar TX module (ESP32)",
+  "main": "electron/main.js",
   "workspaces": [
     "backend",
     "frontend"
@@ -13,9 +14,44 @@
     "start": "npm start -w backend",
     "test": "npm test -w backend",
     "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend",
-    "fake-device": "npm run fake-device -w backend --"
+    "fake-device": "npm run fake-device -w backend --",
+    "electron:dev": "npm run build && npm run rebuild:native && electron .",
+    "electron:build": "npm run build && npm run rebuild:native && electron-builder",
+    "electron:build:mac": "npm run build && npm run rebuild:native && electron-builder --mac",
+    "electron:build:win": "npm run build && npm run rebuild:native && electron-builder --win",
+    "electron:build:linux": "npm run build && npm run rebuild:native && electron-builder --linux",
+    "rebuild:native": "electron-rebuild -f -w serialport",
+    "rebuild:native:cli": "npm rebuild"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "serialport": "^13.0.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
-    "concurrently": "^10.0.5"
+    "@electron/rebuild": "^4.2.0",
+    "concurrently": "^10.0.5",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.sih2026.sonarconsole",
+    "productName": "Adaptive Sonar TX Console",
+    "asar": false,
+    "directories": { "output": "release" },
+    "files": [
+      "electron/**/*",
+      "backend/package.json",
+      "backend/dist/**/*",
+      "frontend/dist/**/*",
+      "node_modules/**/*",
+      "!node_modules/**/{test,tests,*.md,*.map}",
+      "!node_modules/.bin",
+      "!**/*.ts",
+      "!**/*.tsx"
+    ],
+    "mac": { "target": ["dmg", "zip"], "category": "public.app-category.utilities" },
+    "win": { "target": ["nsis", "portable"] },
+    "linux": { "target": ["AppImage", "deb"], "category": "Utility" }
   }
 }

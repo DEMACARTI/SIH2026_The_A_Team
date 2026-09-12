@@ -4,7 +4,7 @@
  * the active chart and the console — not the whole page.
  */
 import { useRef, useSyncExternalStore } from 'react';
-import type { LogEntry, ServerMessage, Source, Status, TelemetryMessage } from './types';
+import type { FuzzyState, LogEntry, SensorRaw, ServerMessage, Source, Status, TelemetryMessage } from './types';
 
 export const HISTORY_CAP = 40;
 export const LOG_CAP = 250;
@@ -20,6 +20,10 @@ export interface HistoryPoint {
   snr: number;
   noiseFloor: number;
   range: number | null;
+  /** false on hardware with no receive chain — snr/noiseFloor/range above are placeholders. */
+  rxAvailable: boolean;
+  fuzzy?: FuzzyState;
+  sensorRaw?: SensorRaw;
 }
 
 export type WsState = 'connecting' | 'open' | 'closed';
@@ -28,6 +32,9 @@ export interface AppState {
   ws: { state: WsState; retryAt: number | null; attempt: number };
   status: Status | null;
   latest: TelemetryMessage | null;
+  /** Most recent message carrying a real captured waveform buffer — survives `latest` moving on
+   *  to the next (sample-less) status frame, and a page refresh, via the `hello` history replay. */
+  lastBurst: TelemetryMessage | null;
   history: HistoryPoint[];
   log: LogEntry[];
 }
@@ -36,6 +43,7 @@ let state: AppState = {
   ws: { state: 'connecting', retryAt: null, attempt: 0 },
   status: null,
   latest: null,
+  lastBurst: null,
   history: [],
   log: [],
 };
@@ -87,6 +95,9 @@ function toPoint(t: TelemetryMessage): HistoryPoint {
     snr: t.snr_db,
     noiseFloor: t.noise_floor_db,
     range: t.target_present ? t.target_range_m : null,
+    rxAvailable: t.rx_available !== false,
+    ...(t.fuzzy ? { fuzzy: t.fuzzy } : {}),
+    ...(t.sensor_raw ? { sensorRaw: t.sensor_raw } : {}),
   };
 }
 
@@ -103,16 +114,22 @@ export function applyServerMessage(msg: ServerMessage): void {
     case 'hello': {
       let history: HistoryPoint[] = [];
       for (const t of msg.history) history = upsertPoint(history, t);
+      const burst = [...msg.history].reverse().find((t) => t.waveform_samples) ?? null;
       setState({
         status: msg.status,
         latest: msg.history[msg.history.length - 1] ?? null,
+        lastBurst: burst,
         history,
         log: msg.log.slice(-LOG_CAP),
       });
       break;
     }
     case 'telemetry':
-      setState({ latest: msg.data, history: upsertPoint(state.history, msg.data) });
+      setState({
+        latest: msg.data,
+        lastBurst: msg.data.waveform_samples ? msg.data : state.lastBurst,
+        history: upsertPoint(state.history, msg.data),
+      });
       break;
     case 'log': {
       const log = [...state.log, msg.entry];

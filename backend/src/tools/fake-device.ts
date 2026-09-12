@@ -6,9 +6,15 @@
  *   npm run fake-device -- --wifi [http://localhost:8080]
  *   npm run fake-device -- --serial /dev/cu.usbserial-XXXX [--baud 115200]
  *   add --garbage to inject malformed lines/bodies now and then
+ *   add --fuzzy to speak the real TX-only fuzzy-logic board's shape instead of the
+ *     SNR-driven design (rx_available: false, fuzzy scores, real waveform_samples)
+ *   add --spectrogram (with --fuzzy) for a SYNTHETIC spectrogram on each transmit —
+ *     the real board needs a DAC->ADC loopback it doesn't have yet (see firmware's
+ *     ENABLE_SPECTROGRAM_MONITOR); this exercises the dashboard's heatmap only
  */
 import { SerialPort } from 'serialport';
-import { parseCommand, type QueuedCommand } from '../contract.js';
+import { parseCommand, type Command, type QueuedCommand } from '../contract.js';
+import { FuzzySimulator } from '../fuzzy-simulator.js';
 import { SonarSimulator } from '../simulator.js';
 
 const args = process.argv.slice(2);
@@ -19,9 +25,19 @@ const opt = (name: string) => {
   return v && !v.startsWith('--') ? v : undefined;
 };
 
-const sim = new SonarSimulator();
+const fuzzy = flag('fuzzy');
+const sim = fuzzy ? new FuzzySimulator() : new SonarSimulator();
 const garbage = flag('garbage');
+const spectrogram = flag('spectrogram');
 const seen: number[] = [];
+let pingRequested = false;
+
+function nextFrame() {
+  if (sim instanceof FuzzySimulator) return pingRequested ? ((pingRequested = false), sim.transmit(spectrogram)) : sim.step();
+  if (pingRequested) sim.applyCommand({ cmd: 'trigger_ping' });
+  pingRequested = false;
+  return sim.step();
+}
 
 function apply(raw: unknown) {
   const c = parseCommand(raw);
@@ -32,14 +48,16 @@ function apply(raw: unknown) {
     seen.push(id);
     if (seen.length > 16) seen.shift();
   }
-  console.log(`  ← ${JSON.stringify(raw)}  → ${sim.applyCommand(c.value)}`);
+  const cmd: Command = c.value;
+  if (cmd.cmd === 'trigger_ping') pingRequested = true;
+  console.log(`  ← ${JSON.stringify(raw)}  → ${sim.applyCommand(cmd)}`);
 }
 
 if (flag('wifi')) {
   const base = (opt('wifi') ?? 'http://localhost:8080').replace(/\/$/, '');
-  console.log(`fake device → WiFi mode, posting to ${base}/api/telemetry`);
+  console.log(`fake device → WiFi mode${fuzzy ? ' (fuzzy TX-only hardware)' : ''}, posting to ${base}/api/telemetry`);
   setInterval(async () => {
-    const t = sim.step();
+    const t = nextFrame();
     const body = garbage && Math.random() < 0.1 ? '{"state": "TRANSMIT", oops' : JSON.stringify(t);
     try {
       const res = await fetch(`${base}/api/telemetry`, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
@@ -59,7 +77,7 @@ if (flag('wifi')) {
   const path = opt('serial')!;
   const baudRate = Number(opt('baud') ?? 115200);
   const port = new SerialPort({ path, baudRate });
-  console.log(`fake device → serial mode on ${path} @ ${baudRate}`);
+  console.log(`fake device → serial mode${fuzzy ? ' (fuzzy TX-only hardware)' : ''} on ${path} @ ${baudRate}`);
   let buf = '';
   port.on('data', (chunk: Buffer) => {
     buf += chunk.toString();
@@ -72,12 +90,12 @@ if (flag('wifi')) {
     }
   });
   setInterval(() => {
-    const t = sim.step();
+    const t = nextFrame();
     if (garbage && Math.random() < 0.1) port.write('{"state":"LIS\n');
     port.write(JSON.stringify(t) + '\n');
     if (t.state === 'IDLE') port.write(`# heap ok, cycle ${t.cycle}\n`);
   }, 1000);
 } else {
-  console.log('usage: npm run fake-device -- --wifi [url] | --serial <path> [--baud N] [--garbage]');
+  console.log('usage: npm run fake-device -- --wifi [url] | --serial <path> [--baud N] [--garbage] [--fuzzy] [--spectrogram]');
   process.exit(1);
 }

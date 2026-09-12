@@ -1,10 +1,10 @@
 import { Play, RefreshCw, Usb, Wifi, FlaskConical } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { connectSerial, disconnectSerial, listPorts, sendCommand, type CommandResult } from '../api';
-import { fmtAgo } from '../format';
+import { fmtAgo, waveformLabel } from '../format';
 import { shallowEqual, useStore } from '../store';
 import { C } from '../theme';
-import type { Command, PortSummary } from '../types';
+import { isFuzzyHardware, type Command, type PortSummary, type Waveform } from '../types';
 import { Panel, StatusDot, Toggle, ui } from './ui';
 import p from './panels.module.css';
 
@@ -50,9 +50,28 @@ function SliderRow({ label, value, unit, min, max, step, disabled, onChange, fmt
   );
 }
 
+const WAVEFORM_MODES: Waveform[] = ['LFM_CHIRP', 'GEOMETRIC_SWEEP', 'PHASE_CODED'];
+
+/** Real fuzzy-logic hardware only supports picking one of 3 discrete waveform modes — no continuous freq/pulse/gain. */
+function WaveformModeButtons({ disabled, send }: { disabled: boolean; send: (cmd: Command) => void }) {
+  const current = useStore((st) => st.latest?.waveform);
+  return (
+    <div className={p.modeButtons}>
+      {WAVEFORM_MODES.map((w) => (
+        <button key={w} type="button" disabled={disabled}
+          className={`${ui.btn} ${current === w ? ui.btnPrimary : ''}`}
+          onClick={() => send({ cmd: 'set_waveform_mode', value: w })}>
+          {waveformLabel(w)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function OperatingMode() {
   const commanded = useStore((st) => st.status?.commandedMode ?? 'auto');
   const reported = useStore((st) => st.latest?.mode);
+  const fuzzy = useStore((st) => isFuzzyHardware(st.latest));
   const live = useStore((st) => st.latest ? {
     frequency_khz: st.latest.frequency_khz, pulse_width_ms: st.latest.pulse_width_ms, gain_db: st.latest.gain_db,
   } : null, (a, b) => (a && b ? shallowEqual(a, b) : a === b));
@@ -86,15 +105,26 @@ function OperatingMode() {
         <div className={p.modeRow}>
           <Toggle label="Operating mode" checked={!manual} onLabel="Auto-adaptive" offLabel="Manual"
             onChange={(auto) => send({ cmd: 'set_mode', value: auto ? 'auto' : 'manual' })} />
-          <span className={p.hint}>{manual ? 'operator sets TX parameters' : 'module adapts to SNR / noise'}</span>
+          <span className={p.hint}>{manual
+            ? (fuzzy ? 'operator picks the waveform mode' : 'operator sets TX parameters')
+            : (fuzzy ? 'fuzzy logic picks the waveform from turbidity/depth/temperature' : 'module adapts to SNR / noise')}</span>
         </div>
-        <SliderRow label="Frequency channel" value={shown.frequency_khz} unit="kHz" min={22} max={42} step={4}
-          disabled={!manual} onChange={(v) => update({ frequency_khz: v })} />
-        <SliderRow label="Pulse width" value={shown.pulse_width_ms} unit="ms" min={0.5} max={5} step={0.1}
-          disabled={!manual} onChange={(v) => update({ pulse_width_ms: v })} fmt={(v) => v.toFixed(1)} />
-        <SliderRow label="Transmit gain" value={shown.gain_db} unit="dB" min={0} max={40} step={1}
-          disabled={!manual} onChange={(v) => update({ gain_db: v })} />
-        {!manual && <span className={p.hint}>Sliders follow the live device values. Switch to Manual to override.</span>}
+        {fuzzy ? (
+          <>
+            <span className={p.hint}>No continuous frequency/pulse/gain control on this hardware — pick a waveform mode directly.</span>
+            <WaveformModeButtons disabled={!manual} send={send} />
+          </>
+        ) : (
+          <>
+            <SliderRow label="Frequency channel" value={shown.frequency_khz} unit="kHz" min={22} max={42} step={4}
+              disabled={!manual} onChange={(v) => update({ frequency_khz: v })} />
+            <SliderRow label="Pulse width" value={shown.pulse_width_ms} unit="ms" min={0.5} max={5} step={0.1}
+              disabled={!manual} onChange={(v) => update({ pulse_width_ms: v })} fmt={(v) => v.toFixed(1)} />
+            <SliderRow label="Transmit gain" value={shown.gain_db} unit="dB" min={0} max={40} step={1}
+              disabled={!manual} onChange={(v) => update({ gain_db: v })} />
+            {!manual && <span className={p.hint}>Sliders follow the live device values. Switch to Manual to override.</span>}
+          </>
+        )}
         <button type="button" className={`${ui.btn} ${ui.btnPrimary}`} onClick={() => send({ cmd: 'trigger_ping' })}>
           <Play size={13} /> Trigger ping now
         </button>

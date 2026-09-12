@@ -4,7 +4,7 @@ import { fmtClock, SOURCE_LABEL } from '../format';
 import { useReducedMotion } from '../hooks';
 import { useStore, type HistoryPoint } from '../store';
 import { C, mono, sans, STATE_COLOR } from '../theme';
-import { NOISE_HOP_DB, SNR_HIGH_DB, SNR_LOW_DB, STATES, type LogEntry } from '../types';
+import { isFuzzyHardware, NOISE_HOP_DB, SNR_HIGH_DB, SNR_LOW_DB, STATES, type LogEntry } from '../types';
 import { Panel } from './ui';
 import p from './panels.module.css';
 
@@ -113,6 +113,23 @@ function toRows(history: HistoryPoint[], metric: Metric): ChartRow[] {
   }));
 }
 
+type FuzzyScoreKey = 'lfm' | 'geo' | 'phase';
+type SensorKey = 'temp_adc' | 'depth_adc' | 'turbidity_adc';
+
+function toFuzzyRows(history: HistoryPoint[], key: FuzzyScoreKey): ChartRow[] {
+  return history.map((h) => {
+    const v = h.fuzzy?.scores[key] ?? null;
+    return { cycle: h.cycle, real: h.source === 'simulated' ? null : v, sim: h.source === 'simulated' ? v : null };
+  });
+}
+
+function toSensorRows(history: HistoryPoint[], key: SensorKey): ChartRow[] {
+  return history.map((h) => {
+    const v = h.sensorRaw?.[key] ?? null;
+    return { cycle: h.cycle, real: h.source === 'simulated' ? null : v, sim: h.source === 'simulated' ? v : null };
+  });
+}
+
 const tick = { fill: C.textFaint, fontSize: 9.5, fontFamily: mono };
 
 const rowsEqual = (a: ChartRow[], b: ChartRow[]) =>
@@ -139,8 +156,10 @@ const TrendChart = memo(function TrendChart({ rows, label, unit, color, domain, 
   return (
     <div className={p.chart}>
       <div className={p.chartHead}>
-        <span>{label} <span className={p.dim}>({unit})</span></span>
-        <span style={{ color, fontFamily: mono }}>{current != null ? current.toFixed(unit === 'kHz' ? 0 : 1) : '—'}</span>
+        <span>{label} {unit && <span className={p.dim}>({unit})</span>}</span>
+        <span style={{ color, fontFamily: mono }}>
+          {current != null ? current.toFixed(unit === 'kHz' || unit === 'adc' ? 0 : unit === '' ? 2 : 1) : '—'}
+        </span>
       </div>
       <ResponsiveContainer width="100%" height={110}>
         <LineChart data={rows} margin={{ top: 6, right: 6, left: -22, bottom: 0 }}>
@@ -168,23 +187,43 @@ const TrendChart = memo(function TrendChart({ rows, label, unit, color, domain, 
 
 function Trends() {
   const history = useStore((st) => st.history);
+  const fuzzy = useStore((st) => isFuzzyHardware(st.latest));
   const hasSim = history.some((h) => h.source === 'simulated');
   const rows = useMemo(() => ({
     frequency: toRows(history, 'frequency'),
     gain: toRows(history, 'gain'),
     snr: toRows(history, 'snr'),
     noiseFloor: toRows(history, 'noiseFloor'),
+    lfm: toFuzzyRows(history, 'lfm'),
+    geo: toFuzzyRows(history, 'geo'),
+    phase: toFuzzyRows(history, 'phase'),
+    temp: toSensorRows(history, 'temp_adc'),
+    depth: toSensorRows(history, 'depth_adc'),
+    turb: toSensorRows(history, 'turbidity_adc'),
   }), [history]);
   return (
-    <Panel title="Adaptive parameter trends"
+    <Panel title={fuzzy ? 'Fuzzy score & sensor trends' : 'Adaptive parameter trends'}
       meta={<>── device{hasSim && <span style={{ color: C.danger }}>  ┄┄ simulated</span>} · last {history.length} cycles</>}>
       <div className={p.charts}>
-        <TrendChart rows={rows.frequency} label="Frequency" unit="kHz" color={C.cyan} domain={[20, 44]} step />
-        <TrendChart rows={rows.gain} label="Gain" unit="dB" color={C.cyan} domain={[0, 40]} />
-        <TrendChart rows={rows.snr} label="SNR" unit="dB" color={C.amber} domain={[-8, 34]}
-          refs={[{ y: SNR_LOW_DB, color: C.danger, label: `${SNR_LOW_DB} dB` }, { y: SNR_HIGH_DB, color: C.textFaint, label: `${SNR_HIGH_DB} dB` }]} />
-        <TrendChart rows={rows.noiseFloor} label="Noise floor" unit="dB" color={C.textMuted} domain={[20, 56]}
-          refs={[{ y: NOISE_HOP_DB, color: C.amberDim, label: 'hop' }]} />
+        {fuzzy ? (
+          <>
+            <TrendChart rows={rows.lfm} label="LFM chirp score" unit="" color={C.cyan} domain={[0, 1]} />
+            <TrendChart rows={rows.geo} label="Geometric score" unit="" color={C.cyan} domain={[0, 1]} />
+            <TrendChart rows={rows.phase} label="Phase-coded score" unit="" color={C.amber} domain={[0, 1]} />
+            <TrendChart rows={rows.turb} label="Turbidity" unit="adc" color={C.amber} domain={[0, 4095]} />
+            <TrendChart rows={rows.depth} label="Depth" unit="adc" color={C.textMuted} domain={[0, 4095]} />
+            <TrendChart rows={rows.temp} label="Temperature" unit="adc" color={C.textMuted} domain={[0, 4095]} />
+          </>
+        ) : (
+          <>
+            <TrendChart rows={rows.frequency} label="Frequency" unit="kHz" color={C.cyan} domain={[20, 44]} step />
+            <TrendChart rows={rows.gain} label="Gain" unit="dB" color={C.cyan} domain={[0, 40]} />
+            <TrendChart rows={rows.snr} label="SNR" unit="dB" color={C.amber} domain={[-8, 34]}
+              refs={[{ y: SNR_LOW_DB, color: C.danger, label: `${SNR_LOW_DB} dB` }, { y: SNR_HIGH_DB, color: C.textFaint, label: `${SNR_HIGH_DB} dB` }]} />
+            <TrendChart rows={rows.noiseFloor} label="Noise floor" unit="dB" color={C.textMuted} domain={[20, 56]}
+              refs={[{ y: NOISE_HOP_DB, color: C.amberDim, label: 'hop' }]} />
+          </>
+        )}
       </div>
     </Panel>
   );
