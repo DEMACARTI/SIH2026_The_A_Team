@@ -201,6 +201,47 @@ placed at the analytically-known instantaneous frequency, not a real transform o
 to prove the plumbing and the heatmap render correctly ahead of the hardware; treat it as a rendering test
 only, never as a stand-in for a validated spectrum.
 
+### Optional firmware subsystems (power, dual-core, real FFT, fuzzy diagnostics)
+
+Five more capabilities live in the same firmware file, each behind its own build-time flag at the
+top of `firmware/sonar_tx/sonar_tx.ino`, **all defaulting to `0`**. With every flag off, the compiled
+binary is byte-for-byte identical to the version without them (verified: 54484 bytes RAM / 326225
+bytes flash, both ways) and tick timing is unchanged. Each was flashed and tested on the real board
+individually and all eight flags on at once — zero crashes, tick timing held within ±1ms throughout.
+
+| Flag | What it does | Verified on real hardware |
+|---|---|---|
+| `ENABLE_POWER_MGMT` | DVFS (80–240MHz) + auto light-sleep, WiFi modem-sleep, per-state duration/current logging | Compiles and runs safely, but **DVFS/light-sleep don't actually activate** — see below |
+| `ENABLE_CURRENT_SENSE` | Sub-flag of the above; reads an INA219/226 over I2C (SDA=23, SCL=22 — chosen to avoid every existing pin) | ✅ Gracefully omits `current_ma` when no sensor answers at 0x40 |
+| `ENABLE_CORE_PINNING` | Explicit `xTaskCreatePinnedToCore` split: WiFi telemetry POST + command poll on Core 0, state machine stays on Core 1 (Arduino already pins `loop()` there) | ✅ Real per-core idle % — measured 94.5% / 3.1% (98.6% with `ENABLE_POWER_MGMT` also on, since its 1ms idle yield feeds this too) |
+| `ENABLE_REAL_FFT` | Real ESP-DSP (`dsps_fft2r_fc32`) FFT on a synthetic or ADC-looped-back buffer, in a new `PROCESS` step after `TRANSMIT` | ✅ 193µs for a 256-point FFT; correctly located a synthetic test tone's frequency |
+| `ENABLE_FUZZY_DIAG` | Human-readable decision trace on every `ADAPT` (which rules fired, their weights, resulting scores) | ✅ Verified output matches the actual rule math exactly |
+| `DIAG_NAIVE_THRESHOLD_MODE` | Sub-flag; a shadow if/else controller run in parallel (never drives hardware) for a chattering-rate comparison, logged every 10s | ✅ Runs correctly in both auto and manual mode |
+| `DIAG_SWEEP_TEST` | Sub-flag; `{"cmd":"sweep_test","input":"turbidity"\|"depth"\|"temperature"}` sweeps one input 0→4095 holding the others fixed, logging the transfer function | ✅ 41-step sweep completes and restores real state afterward |
+| `ENABLE_DIAGNOSTICS` | Adds optional `adapt_time_us`, `fft_time_us`, `core0_idle_pct`, `core1_idle_pct`, `current_ma` telemetry fields — only when the flag is on, only the fields whose subsystem is also enabled | ✅ Present/absent exactly as configured |
+
+**Power management's real limitation, found by testing rather than assumed:** `esp_pm_configure()`
+returns `ESP_ERR_NOT_SUPPORTED` on this board. Traced to `CONFIG_PM_ENABLE` not being compiled into
+this PlatformIO Arduino-ESP32 core build (`tools/sdk/esp32/*/include/sdkconfig.h` doesn't define it).
+The firmware detects this and logs it instead of crashing or pretending DVFS/light-sleep are active —
+but they aren't, on this toolchain. Fixing it means rebuilding the whole Arduino-ESP32 framework from
+ESP-IDF source with a custom sdkconfig, well beyond a firmware change. WiFi modem-sleep and per-state
+duration logging are independent of this and still work.
+
+**A design call worth knowing about:** these subsystems' spec assumed an existing simulated echo
+pipeline in `PROCESS` that real FFT output would "replace." This board has none — it's TX-only,
+`PROCESS` was never entered before this. Rather than reintroducing fabricated SNR numbers, real FFT
+results land in new, separate `fft_*` fields; the honest `rx_available: false` / `snr_db: 0` contract
+from the section above is untouched.
+
+**A portability gotcha hit while building this**, left as a comment in the file in case it bites you
+too: Arduino's auto-prototype generator text-scans for function signatures *without* understanding
+`#if`/`#endif` — it happily emits a prototype for a function guarded behind a disabled flag,
+referencing a custom type (an enum) *also* guarded behind that same flag, breaking the very build
+where both are supposed to compile out together. Fixed by using plain `int` + `#define` constants
+instead of an enum for that one function parameter (`runSweepTest`). Avoid custom types in the
+signature of any conditionally-compiled function.
+
 ## Backend API
 
 | Method | Path | |

@@ -53,6 +53,40 @@
 // dac_continuous gives smoother, truly DMA-timed output; this timer-ISR version is the
 // portable fallback and is what this repo's CI/PlatformIO build actually compiles against.
 
+// ============================== OPTIONAL DIAGNOSTIC/PM FEATURES =============
+// Every flag below defaults OFF. With all of them off, this file's behavior and
+// timing are unchanged from the baseline — none of the code they guard runs,
+// and none of it touches waveform generation, DMA/DAC config, pin assignments,
+// or the manual-override button logic. Each subsystem is documented at its own
+// definition further down.
+#define ENABLE_POWER_MGMT      0   // §1 CPU/light-sleep/WiFi power saving + optional current sense
+#define ENABLE_CURRENT_SENSE   0   //   sub-flag of §1 — needs ENABLE_POWER_MGMT; INA219/226 on I2C
+#define ENABLE_CORE_PINNING    0   // §2 explicit dual-core task split (comms vs. state machine)
+#define ENABLE_REAL_FFT        0   // §3 real ESP-DSP FFT compute path (synthetic or looped-back input)
+#define ENABLE_FUZZY_DIAG      0   // §4 fuzzy decision-trace logging
+#define DIAG_NAIVE_THRESHOLD_MODE 0 //  sub-flag of §4 — shadow if/else controller for chattering comparison
+#define DIAG_SWEEP_TEST        0   //   sub-flag of §4 — {"cmd":"sweep_test","input":"..."} transfer-function sweep
+#define ENABLE_DIAGNOSTICS     0   // §5 optional extra telemetry fields surfacing the above measurements
+
+#if ENABLE_POWER_MGMT
+#include "esp_pm.h"
+#include "esp_sleep.h"
+#endif
+#if ENABLE_CURRENT_SENSE
+#include <Wire.h>
+#endif
+#if ENABLE_CORE_PINNING
+#include "esp_freertos_hooks.h"  // per-core idle-hook based idle% measurement
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#endif
+#if ENABLE_REAL_FFT
+#include "dsps_fft2r.h"   // ESP-DSP — prebuilt for classic ESP32 in this toolchain (verified before use)
+// Uses the existing hannWindow() helper below for windowing, not a separate ESP-DSP window
+// function — one less new dependency, and it's the exact same window already used elsewhere.
+#endif
+
 // ============================== USER CONFIG ===============================
 #define WIFI_SSID        ""               // leave empty for USB-serial only
 #define WIFI_PASS        ""
@@ -79,12 +113,26 @@ const int ledRed = 18;
 const int ledGreen = 19;
 const int ledBlue = 21;
 
+#if ENABLE_CURRENT_SENSE
+// Not the Wire library's default (usually 21/22 on ESP32 devkits) — 21 is already ledBlue
+// above, and pin assignments aren't to change, so the current-sense I2C bus uses its own pins.
+const int I2C_SDA_PIN = 23;
+const int I2C_SCL_PIN = 22;
+#endif
+
 // ============================== CONTRACT ====================================
 // Declared before any function definitions: Arduino's auto-prototype generator
 // inserts function prototypes right before the first function body in the file,
 // so any custom type (like this enum) used as a parameter must already be
 // visible by then, or the auto-generated prototype fails to compile.
 enum SonarState : uint8_t { IDLE, TRANSMIT, LISTEN, PROCESS, ADAPT };  // LISTEN/PROCESS unused — no RX chain
+// SWEEP_* below are plain ints, not an enum: Arduino's auto-prototype generator scans raw text
+// for function signatures WITHOUT understanding #if/#endif, so it would still emit a prototype
+// for runSweepTest() referencing a custom enum type even when both are compiled out together —
+// a real error this file hit while adding §4. Plain ints sidestep that entirely.
+#define SWEEP_TURBIDITY 0
+#define SWEEP_DEPTH 1
+#define SWEEP_TEMPERATURE 2
 static const char *const STATE_NAMES[] = {"IDLE", "TRANSMIT", "LISTEN", "PROCESS", "ADAPT"};
 
 int currentMode = 0;
@@ -266,6 +314,122 @@ void computeSpectrogram() {
 }
 #endif
 
+// ============================== §1 POWER MANAGEMENT =========================
+// DVFS (dynamic CPU frequency scaling) + automatic light sleep, WiFi modem
+// sleep between sends, and per-state duration/current logging. Two esp_pm
+// LOCKS (not manual esp_light_sleep_start() calls) guard the transmit-critical
+// section: automatic light sleep only fires when the FreeRTOS idle task runs,
+// which never happens mid-burst since the main loop is busy waiting on the
+// DAC/ADC timers — but the lock makes that guarantee explicit and holds even
+// if that busy-wait is ever refactored later. A hardware timer (the DAC/ADC
+// ISRs) always wakes the CPU from light sleep, so the ISR-driven burst timing
+// itself is unaffected either way; the lock exists per the guardrail "don't
+// sleep through a DMA/ADC-active window" as a belt-and-braces guarantee, not
+// because a timing failure was observed without it.
+//
+// "Batch WiFi telemetry: send once per completed cycle" — already true of the
+// existing design (buildAndSendTelemetry() is called exactly once per
+// stepCycle(), and stepCycle() runs once per tick); the lever this section
+// actually pulls for WiFi power is modem sleep between those sends.
+#if ENABLE_POWER_MGMT
+esp_pm_lock_handle_t pmLockFreqMax = nullptr;
+esp_pm_lock_handle_t pmLockNoSleep = nullptr;
+
+/** Hold CPU at max frequency and block auto light-sleep for a timing-critical section. */
+void pmEnterActive() {
+  if (pmLockFreqMax) esp_pm_lock_acquire(pmLockFreqMax);
+  if (pmLockNoSleep) esp_pm_lock_acquire(pmLockNoSleep);
+}
+void pmExitActive() {
+  if (pmLockNoSleep) esp_pm_lock_release(pmLockNoSleep);
+  if (pmLockFreqMax) esp_pm_lock_release(pmLockFreqMax);
+}
+
+void pmSetup() {
+  esp_pm_config_esp32_t cfg = {};
+  cfg.max_freq_mhz = 240;
+  cfg.min_freq_mhz = 80;   // scales down automatically between transmits; restored by pmEnterActive() before one
+  cfg.light_sleep_enable = true;
+  esp_err_t err = esp_pm_configure(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("# power mgmt: esp_pm_configure failed (%s) — DVFS/light-sleep NOT active\n", esp_err_to_name(err));
+    return;
+  }
+  esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "tx_freq", &pmLockFreqMax);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "tx_nosleep", &pmLockNoSleep);
+  Serial.println("# power mgmt: DVFS 80-240MHz + auto light-sleep armed");
+}
+
+// ---------- optional current sense (INA219/226), its own sub-flag ----------
+#if ENABLE_CURRENT_SENSE
+const uint8_t INA219_ADDR = 0x40;               // default breakout address
+const float INA219_SHUNT_OHMS = 0.1f;           // standard breakout shunt — adjust if yours differs
+bool currentSenseReady = false;
+
+bool ina219WriteReg(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.write(value >> 8);
+  Wire.write(value & 0xFF);
+  return Wire.endTransmission() == 0;
+}
+
+bool ina219ReadReg(uint8_t reg, int16_t &out) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;  // repeated start
+  if (Wire.requestFrom((int)INA219_ADDR, 2) != 2) return false;
+  out = (int16_t)((Wire.read() << 8) | Wire.read());
+  return true;
+}
+
+/** Probes for the sensor at startup; if absent, fails gracefully (currentSenseReady stays
+ *  false, current_ma is simply omitted from telemetry) rather than blocking boot. */
+void currentSenseSetup() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.beginTransmission(INA219_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.printf("# current sense: no INA219/226 found at 0x%02X — current_ma will be omitted\n", INA219_ADDR);
+    return;
+  }
+  // Bus voltage range 32V, gain /8 (PGA ±320mV), 12-bit — the INA219 power-on default; a
+  // calibration register write isn't needed since current is derived directly from the raw
+  // shunt-voltage register (Ohm's law) below, not the chip's own scaled CURRENT register.
+  ina219WriteReg(0x00, 0x399F);
+  currentSenseReady = true;
+  Serial.println("# current sense: INA219/226 found and configured");
+}
+
+/** Direct Ohm's-law current from the raw shunt-voltage register (LSB = 10uV) — sidesteps
+ *  needing this board's exact calibration constant for the chip's scaled CURRENT register. */
+float currentSenseReadMa() {
+  if (!currentSenseReady) return NAN;
+  int16_t shuntRaw;
+  if (!ina219ReadReg(0x01, shuntRaw)) return NAN;
+  float shuntVoltageMv = shuntRaw * 0.01f;  // 10uV/LSB
+  return (shuntVoltageMv / 1000.0f) / INA219_SHUNT_OHMS * 1000.0f;
+}
+#endif
+
+/** Called once per tick from stepCycle(), after the state for this tick is decided — logs how
+ *  long the PREVIOUS tick spent in its state, and (if available) the current drawn during it.
+ *  This is the raw data the acceptance criteria's avg_current_ma = Σ(I×t)/T is computed from. */
+uint64_t pmLastLogUs = 0;
+void pmLogState(const char *stateName) {
+  uint64_t now = esp_timer_get_time();
+  uint64_t durationUs = pmLastLogUs ? (now - pmLastLogUs) : 0;
+  pmLastLogUs = now;
+#if ENABLE_CURRENT_SENSE
+  float ma = currentSenseReadMa();
+  if (!isnan(ma)) {
+    Serial.printf("# power: state=%s duration_us=%llu current_ma=%.2f\n", stateName, durationUs, ma);
+    return;
+  }
+#endif
+  Serial.printf("# power: state=%s duration_us=%llu\n", stateName, durationUs);
+}
+#endif  // ENABLE_POWER_MGMT
+
 // ============================== STATE =======================================
 static uint32_t cycle = 0;
 static bool autoMode = true;
@@ -293,6 +457,139 @@ static uint32_t lastPollMs = 0;
 
 static const String TELEMETRY_URL = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + "/api/telemetry";
 static const String COMMANDS_URL = String("http://") + BACKEND_HOST + ":" + BACKEND_PORT + "/api/commands/pending";
+
+// ============================== §2 DUAL-CORE SCHEDULING ======================
+// Arduino-ESP32 already pins the sketch's setup()/loop() to Core 1 by framework
+// default (the "loopTask"), with the WiFi/BT stack's own internal tasks
+// already running on Core 0 — so "Core 1 = state machine, Core 0 = comms" is
+// already the framework's baseline split, before this flag does anything.
+// What this section adds, explicitly, via xTaskCreatePinnedToCore as asked:
+//   (a) a dedicated Core-0 task owning the WiFi telemetry POST and command
+//       poll, so an HTTPClient call blocking for up to HTTP_TIMEOUT_MS can
+//       never stall Core 1's tick timing the way it does today when off
+//       (postTelemetry()/pollCommands() currently run inline in loop());
+//   (b) real, MEASURED per-core idle-time reporting.
+// A queue hands data each way so shared state (currentMode, autoMode, ...) is
+// still only ever mutated from one core (1), avoiding a data race — commands
+// arriving over WiFi are parsed on core 0 but applied on core 1, the same as
+// commands arriving over USB already are.
+//
+// Placed here (after STATE), not up with §1/§3: it needs wifiEnabled/
+// backendReachable/lastPollMs, plain variables declared textually above —
+// same reason §3 lives after WAVEFORM GENERATION instead of near the top.
+#if ENABLE_CORE_PINNING
+QueueHandle_t telemetryOutQueue = nullptr;  // core1(loop) -> core0: JSON strings to POST
+QueueHandle_t commandInQueue = nullptr;     // core0 -> core1(loop): JSON strings to applyCommand()
+
+// ---------- idle-time measurement ----------
+// vTaskGetRunTimeStats()/uxTaskGetSystemState() need CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS,
+// which this toolchain's prebuilt FreeRTOS was NOT built with (checked in
+// tools/sdk/esp32/*/include/sdkconfig.h before writing this — the define is absent). Idle % is
+// measured via the per-core idle-task hook instead: it's invoked continuously whenever a core's
+// idle task actually gets to run, so counting hits per unit time — normalized against a one-time
+// startup calibration taken with nothing else yet running — gives a real measured percentage,
+// not an assumed one.
+volatile uint32_t idleHits[2] = {0, 0};
+float idleCalibrationPerMs[2] = {1, 1};
+float core0IdlePct = 0, core1IdlePct = 0;
+uint32_t lastIdleStatsMs = 0;
+
+bool idleHookCore0() { idleHits[0]++; return false; }  // false = "I did not put the CPU to sleep myself"
+bool idleHookCore1() { idleHits[1]++; return false; }
+
+void idlePinCalibrate() {
+  idleHits[0] = 0; idleHits[1] = 0;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 150) delay(1);  // nothing else is running yet at this point in setup()
+  // Manual comparisons, not max<T>(): millis() returns unsigned long and idleHits[] is volatile
+  // uint32_t — both mismatch std::max<T>()'s strict same-type deduction (<algorithm> shadows
+  // Arduino's looser max() macro here).
+  uint32_t elapsedMs = (uint32_t)(millis() - t0);
+  uint32_t elapsed = elapsedMs > 0 ? elapsedMs : 1;
+  uint32_t hits0 = idleHits[0], hits1 = idleHits[1];  // non-volatile copies
+  idleCalibrationPerMs[0] = (hits0 > 0 ? hits0 : 1) / (float)elapsed;
+  idleCalibrationPerMs[1] = (hits1 > 0 ? hits1 : 1) / (float)elapsed;
+  Serial.printf("# core pinning: idle-hook calibration core0=%.1f/ms core1=%.1f/ms\n",
+    idleCalibrationPerMs[0], idleCalibrationPerMs[1]);
+}
+
+/** Refreshes core{0,1}IdlePct from the idle-hook hit rate over the last ~1s. Call from loop(). */
+void idlePinStatsTick() {
+  uint32_t now = millis();
+  if (lastIdleStatsMs == 0) { lastIdleStatsMs = now; idleHits[0] = 0; idleHits[1] = 0; return; }
+  uint32_t elapsed = now - lastIdleStatsMs;
+  if (elapsed < 1000) return;
+  core0IdlePct = constrain(100.0f * (idleHits[0] / (float)elapsed) / idleCalibrationPerMs[0], 0, 100);
+  core1IdlePct = constrain(100.0f * (idleHits[1] / (float)elapsed) / idleCalibrationPerMs[1], 0, 100);
+  Serial.printf("# core idle: core0=%.1f%% core1=%.1f%%\n", core0IdlePct, core1IdlePct);
+  idleHits[0] = 0; idleHits[1] = 0;
+  lastIdleStatsMs = now;
+}
+
+/** Like pollCommands(), but hands each command's raw JSON to core 1 via the queue instead of
+ *  calling applyCommand() directly here, so state mutation stays on one core. */
+void pollCommandsToQueue() {
+  HTTPClient http;
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(COMMANDS_URL)) return;
+  int code = http.GET();
+  if (code == 200) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getString())) {
+      for (JsonObjectConst c : doc["commands"].as<JsonArrayConst>()) {
+        String s;
+        serializeJson(c, s);
+        char *copy = strdup(s.c_str());
+        if (copy && xQueueSend(commandInQueue, &copy, 0) != pdTRUE) free(copy);  // queue full: drop, don't block comms
+      }
+    }
+  }
+  http.end();
+  backendReachable = code == 200;
+}
+
+/** Core 0 task: owns WiFi telemetry POST + command polling, off Core 1's timing-critical path. */
+void core0CommsTask(void *arg) {
+  (void)arg;
+  for (;;) {
+    char *json = nullptr;
+    if (xQueueReceive(telemetryOutQueue, &json, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (wifiEnabled && WiFi.status() == WL_CONNECTED) postTelemetry(String(json));
+      free(json);
+    }
+    uint32_t now = millis();
+    uint32_t pollEvery = backendReachable ? COMMAND_POLL_MS : BACKOFF_POLL_MS;
+    if (wifiEnabled && WiFi.status() == WL_CONNECTED && now - lastPollMs >= pollEvery) {
+      lastPollMs = now;
+      pollCommandsToQueue();
+    }
+  }
+}
+
+void corePinningSetup() {
+  telemetryOutQueue = xQueueCreate(4, sizeof(char *));
+  commandInQueue = xQueueCreate(8, sizeof(char *));
+  esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
+  esp_register_freertos_idle_hook_for_cpu(idleHookCore1, 1);
+  idlePinCalibrate();
+  xTaskCreatePinnedToCore(core0CommsTask, "core0_comms", 8192, nullptr, 1, nullptr, 0);
+  Serial.println("# core pinning: comms task pinned to core 0; state machine stays on core 1 (loop)");
+}
+
+/** Drains commands core0CommsTask queued from its WiFi poll — called from loop() on core 1, the
+ *  same core (and same call site) USB commands are already applied from, so currentMode/
+ *  autoMode/etc. are only ever mutated from this one place regardless of which link they arrive
+ *  on. */
+void drainQueuedCommands() {
+  char *json;
+  while (xQueueReceive(commandInQueue, &json, 0) == pdTRUE) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, json)) applyCommand(doc.as<JsonObjectConst>());
+    free(json);
+  }
+}
+#endif  // ENABLE_CORE_PINNING
 
 // ============================== HELPERS =====================================
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -336,6 +633,110 @@ int evaluateFuzzyMode(int potTurbIn, int potDepthIn, int potTempIn,
   if (geoScoreOut >= lfmScoreOut && geoScoreOut >= phaseScoreOut) return 1;
   return 2;
 }
+
+// ============================== §4 FUZZY LOGIC DIAGNOSTICS ==================
+// Logging and comparison tooling around the fuzzy core above — reads its
+// state, never changes its math or its rule weights.
+#if ENABLE_FUZZY_DIAG
+/** Human-readable trace of one ADAPT decision: memberships, which rules fired
+ *  (nonzero contribution) and their weights, and the resulting scores/choice. */
+void fuzzyDiagTrace() {
+  if (!autoMode) { Serial.println("# fuzzy trace: manual override — controller not driving this decision"); return; }
+  Serial.println("# fuzzy trace ---------------------------------------------");
+  Serial.printf("#   turbidity=%d   low=%.3f  med=%.3f  high=%.3f\n", potTurb, turbLow, turbMed, turbHigh);
+  Serial.printf("#   depth=%d       low=%.3f  med=%.3f  high=%.3f\n", potDepth, depthLow, depthMed, depthHigh);
+  Serial.printf("#   temperature=%d cold=%.3f normal=%.3f warm=%.3f\n", potTemp, tempCold, tempNormal, tempWarm);
+  Serial.println("#   rules fired (input membership x weight -> contribution):");
+  if (turbHigh > 0) Serial.printf("#     R1 turbidity-high  %.3f x 1.0 -> phase += %.3f\n", turbHigh, turbHigh);
+  if (turbMed > 0)  Serial.printf("#     R2 turbidity-med   %.3f x 0.4 -> phase += %.3f\n", turbMed, turbMed * 0.4f);
+  if (depthHigh > 0) Serial.printf("#     R3 depth-high      %.3f x 1.0 -> geo   += %.3f\n", depthHigh, depthHigh);
+  if (depthMed > 0)  Serial.printf("#     R4 depth-med       %.3f x 0.4 -> geo   += %.3f\n", depthMed, depthMed * 0.4f);
+  float andVal = min(turbLow, depthLow);
+  if (andVal > 0)    Serial.printf("#     R5 min(turb-low,depth-low) %.3f x 1.0 -> lfm += %.3f\n", andVal, andVal);
+  if (tempWarm > 0)  Serial.printf("#     R6 temp-warm       %.3f x 0.3 -> lfm   += %.3f\n", tempWarm, tempWarm * 0.3f);
+  if (tempCold > 0)  Serial.printf("#     R7 temp-cold       %.3f x 0.3 -> geo   += %.3f\n", tempCold, tempCold * 0.3f);
+  Serial.printf("#   scores: lfm=%.3f geo=%.3f phase=%.3f -> chosen=%s\n", lfmScore, geoScore, phaseScore, modeNames[currentMode]);
+}
+
+// ---------- naive if/else shadow controller, for the chattering comparison ----------
+#if DIAG_NAIVE_THRESHOLD_MODE
+/** Hard-threshold controller with the SAME inputs/outputs as the fuzzy one, same rule
+ *  precedence (turbidity, then depth, else default), but no graded membership — the
+ *  comparison baseline for chattering behavior on noisy input. Purely a shadow: its
+ *  result is never applied to hardware. */
+int naiveThresholdMode(int turb, int depth, int temp) {
+  (void)temp;  // the fuzzy controller only uses temperature as a secondary tiebreak; the naive
+               // baseline keeps to the two dominant inputs for a like-for-like comparison
+  if (turb > 2048) return 2;   // PHASE_CODED
+  if (depth > 2048) return 1;  // GEOMETRIC_SWEEP
+  return 0;                    // LFM_CHIRP
+}
+
+int fuzzyModeShadow = 0, naiveModeShadow = 0;
+int fuzzyChatterCount = 0, naiveChatterCount = 0;
+uint32_t lastChatterLogMs = 0;
+
+/** Runs both controllers on this tick's raw inputs and counts mode-switch ("chattering")
+ *  events for each over a rolling window. Call once per tick, after sensors are sampled.
+ *  Re-evaluating the fuzzy controller here (into scratch outputs, not the real
+ *  lfmScore/geoScore/phaseScore) keeps this comparison running even in manual mode, where
+ *  sampleSensorsAndEvaluate() intentionally stops calling it — without that, "fuzzy
+ *  chattering" would silently start measuring manual button presses instead. */
+void naiveThresholdTick() {
+  float lfmS, geoS, phaseS;
+  int fuzzyMode = evaluateFuzzyMode(potTurb, potDepth, potTemp, lfmS, geoS, phaseS);
+  int naiveMode = naiveThresholdMode(potTurb, potDepth, potTemp);
+  if (fuzzyMode != fuzzyModeShadow) { fuzzyModeShadow = fuzzyMode; fuzzyChatterCount++; }
+  if (naiveMode != naiveModeShadow) { naiveModeShadow = naiveMode; naiveChatterCount++; }
+
+  uint32_t now = millis();
+  if (lastChatterLogMs == 0) lastChatterLogMs = now;
+  if (now - lastChatterLogMs >= 10000) {
+    float windowS = (now - lastChatterLogMs) / 1000.0f;
+    Serial.printf("# chattering (last %.1fs%s): fuzzy=%d (%.2f/s)  naive=%d (%.2f/s)\n",
+      windowS, autoMode ? "" : ", device in manual — both shadow-only",
+      fuzzyChatterCount, fuzzyChatterCount / windowS, naiveChatterCount, naiveChatterCount / windowS);
+    fuzzyChatterCount = 0;
+    naiveChatterCount = 0;
+    lastChatterLogMs = now;
+  }
+}
+#endif  // DIAG_NAIVE_THRESHOLD_MODE
+
+// ---------- input-vs-output transfer function sweep ----------
+#if DIAG_SWEEP_TEST
+/** Sweeps one input across its full 0-4095 range (holding the other two at their current
+ *  actual pot readings) and logs the chosen mode + scores at each step, for building an
+ *  input-vs-output transfer function chart. Runs synchronously (briefly blocks the tick
+ *  loop) since it's an explicitly-triggered bench diagnostic, not a real-time path. Saves
+ *  and restores the real membership globals so it doesn't corrupt live telemetry state. */
+void runSweepTest(int input) {
+  const float saveTL = turbLow, saveTM = turbMed, saveTH = turbHigh;
+  const float saveDL = depthLow, saveDM = depthMed, saveDH = depthHigh;
+  const float saveTC = tempCold, saveTN = tempNormal, saveTW = tempWarm;
+  const int fixedTurb = potTurb, fixedDepth = potDepth, fixedTemp = potTemp;
+  const char *inputName = input == SWEEP_TURBIDITY ? "turbidity" : input == SWEEP_DEPTH ? "depth" : "temperature";
+
+  Serial.printf("# sweep_test start: input=%s, others held at turb=%d depth=%d temp=%d\n",
+    inputName, fixedTurb, fixedDepth, fixedTemp);
+  Serial.println("# sweep,input,value,lfm_score,geo_score,phase_score,mode");
+  for (int v = 0; v <= 4095; v += 100) {
+    int turb = (input == SWEEP_TURBIDITY) ? v : fixedTurb;
+    int depth = (input == SWEEP_DEPTH) ? v : fixedDepth;
+    int temp = (input == SWEEP_TEMPERATURE) ? v : fixedTemp;
+    float lfm, geo, phase;
+    int mode = evaluateFuzzyMode(turb, depth, temp, lfm, geo, phase);
+    Serial.printf("# sweep,%s,%d,%.3f,%.3f,%.3f,%s\n", inputName, v, lfm, geo, phase, modeNames[mode]);
+    delay(5);  // pace output so USB-CDC doesn't drop lines under the burst
+  }
+  Serial.println("# sweep_test complete");
+
+  turbLow = saveTL; turbMed = saveTM; turbHigh = saveTH;
+  depthLow = saveDL; depthMed = saveDM; depthHigh = saveDH;
+  tempCold = saveTC; tempNormal = saveTN; tempWarm = saveTW;
+}
+#endif  // DIAG_SWEEP_TEST
+#endif  // ENABLE_FUZZY_DIAG
 
 // ---------- WAVEFORM GENERATION (unchanged math — real DAC burst) ----------
 float hannWindow(int index, int total) {
@@ -397,6 +798,95 @@ void generatePhaseCoded(int durationMs, int ampScaleIn) {
     waveformBuffer[i] = constrain(sample, 0, 255);
   }
 }
+
+// ============================== §3 REAL FFT ECHO ANALYSIS ===================
+// This board has no receive chain (see file header) — PROCESS is never entered
+// today. When this flag is on, a PROCESS step runs after TRANSMIT, with a real
+// ESP-DSP FFT over either the spectrogram monitor's real ADC-loopback samples
+// (if ENABLE_SPECTROGRAM_MONITOR is also on and has them) or, absent that, a
+// synthetically-injected buffer — exercising the real compute path exactly as
+// the spec allows without requiring new hardware immediately.
+//
+// The result is exposed as NEW fft_* fields (see buildAndSendTelemetry()),
+// deliberately never written into rx_available/snr_db/noise_floor_db: this
+// board still has no real echo to measure, and overwriting those honest
+// placeholders with FFT-of-a-synthetic-buffer would misrepresent them as a
+// real measurement — undoing the point of rx_available: false in the first
+// place. Keep the existing simulated/absent-echo path exactly as it is; this
+// only adds new, clearly-separate fields alongside it.
+//
+// Placed here (after WAVEFORM GENERATION), not up with the other §-sections
+// near the top: it needs freqMax and hannWindow(), both plain variables/
+// functions declared textually above this point — unlike the enum-as-
+// parameter issue elsewhere in this file, there's no auto-prototyping
+// workaround for an ordinary variable, so it has to go after them for real.
+#if ENABLE_REAL_FFT
+const int ECHO_FFT_SIZE = 256;  // power of 2, within ESP-DSP's default table size limit
+float echoFftBuf[ECHO_FFT_SIZE * 2];  // interleaved Re0,Im0,Re1,Im1,...
+bool fftReady = false;
+int64_t lastFftTimeUs = 0;
+float fftSnrDb = 0, fftNoiseFloorDb = 0, fftPeakFreqHz = 0;
+
+void fftSetup() {
+  esp_err_t err = dsps_fft2r_init_fc32(NULL, ECHO_FFT_SIZE);
+  fftReady = (err == ESP_OK);
+  Serial.printf("# real FFT: init %s (size=%d)\n", fftReady ? "OK" : "FAILED", ECHO_FFT_SIZE);
+}
+
+void fillEchoBuffer() {
+#if ENABLE_SPECTROGRAM_MONITOR
+  if (monitorCount >= ECHO_FFT_SIZE) {
+    // Real ADC-captured samples (from the DAC->ADC loopback, once wired) — still just the TX
+    // signal looped back, not a true received echo, but genuinely real ADC data either way.
+    for (int i = 0; i < ECHO_FFT_SIZE; i++) {
+      echoFftBuf[2 * i] = ((float)monitorBuffer[i] - 2048.0f) * hannWindow(i, ECHO_FFT_SIZE);
+      echoFftBuf[2 * i + 1] = 0.0f;
+    }
+    return;
+  }
+#endif
+  // No receiver connected: synthesize a plausible decaying-tone-plus-noise buffer purely to
+  // exercise the FFT/peak-detection compute path, as the spec explicitly permits.
+  float toneFreq = freqMax * 0.6f;
+  for (int i = 0; i < ECHO_FFT_SIZE; i++) {
+    float envelope = expf(-3.0f * i / ECHO_FFT_SIZE);
+    float sample = envelope * 800.0f * sinf(2.0f * PI * toneFreq * i / SAMPLE_RATE) + (float)(random(-100, 100));
+    echoFftBuf[2 * i] = sample * hannWindow(i, ECHO_FFT_SIZE);
+    echoFftBuf[2 * i + 1] = 0.0f;
+  }
+}
+
+/** Runs the real FFT, times it, and derives a peak/noise-floor estimate. */
+void runFftProcessStep() {
+  if (!fftReady) return;
+  fillEchoBuffer();
+  int64_t t0 = esp_timer_get_time();
+  dsps_fft2r_fc32(echoFftBuf, ECHO_FFT_SIZE);
+  dsps_bit_rev_fc32(echoFftBuf, ECHO_FFT_SIZE);
+  lastFftTimeUs = esp_timer_get_time() - t0;
+
+  const int nBins = ECHO_FFT_SIZE / 2;
+  float sum = 0, peak = 0;
+  int peakBin = 0;
+  for (int i = 0; i < nBins; i++) {
+    float re = echoFftBuf[2 * i], im = echoFftBuf[2 * i + 1];
+    float mag = sqrtf(re * re + im * im);
+    sum += mag;
+    if (mag > peak) { peak = mag; peakBin = i; }
+  }
+  float noiseFloor = (sum - peak) / max(1, nBins - 1);
+  fftNoiseFloorDb = 20.0f * log10f(max(noiseFloor, 1e-6f));
+  fftSnrDb = 20.0f * log10f(max(peak, 1e-6f)) - fftNoiseFloorDb;
+  fftPeakFreqHz = (float)peakBin * SAMPLE_RATE / ECHO_FFT_SIZE;
+
+  // "Listen-window budget" for a board with no actual listen window: the tick period is the
+  // real timing budget this firmware operates under, so that's what's reported against — not a
+  // claim about a receive window this hardware doesn't have.
+  float headroomPct = 100.0f * (1.0f - (float)lastFftTimeUs / ((float)TICK_MS * 1000.0f));
+  Serial.printf("# fft: %lldus for %d-pt FFT, budget=%dms tick -> %.1f%% headroom, peak=%.0fHz snr=%.1fdB noise=%.1fdB\n",
+    lastFftTimeUs, ECHO_FFT_SIZE, TICK_MS, headroomPct, fftPeakFreqHz, fftSnrDb, fftNoiseFloorDb);
+}
+#endif  // ENABLE_REAL_FFT
 
 /** Evenly-spaced picks from the real buffer just generated — small enough for one JSON line. */
 void decimateForTelemetry() {
@@ -505,11 +995,24 @@ void readButtons() {
 
 // ============================== ONE TICK ====================================
 /** One ~1s cycle: sample+evaluate (always), then IDLE, or ADAPT on a mode change, or TRANSMIT on request. */
+#if ENABLE_DIAGNOSTICS
+int64_t lastAdaptTimeUs = 0;  // wall time of the sampleSensorsAndEvaluate() call just below
+#endif
+
 void stepCycle() {
   stepLog = "";
+#if ENABLE_DIAGNOSTICS
+  int64_t adaptT0 = esp_timer_get_time();
+#endif
   bool modeChanged = sampleSensorsAndEvaluate();
+#if ENABLE_DIAGNOSTICS
+  lastAdaptTimeUs = esp_timer_get_time() - adaptT0;
+#endif
   if (manualChangeFlag) { modeChanged = true; manualChangeFlag = false; }
   bool transmitting = pingRequested;
+#if ENABLE_FUZZY_DIAG && DIAG_NAIVE_THRESHOLD_MODE
+  naiveThresholdTick();  // shadow comparison only — never affects currentMode/hardware below
+#endif
 
   SonarState state;
   if (transmitting) {
@@ -527,6 +1030,9 @@ void stepCycle() {
   if (transmitting) {
     cycle++;
     digitalWrite(ledGreen, HIGH);
+#if ENABLE_POWER_MGMT
+    pmEnterActive();  // full CPU clock + no auto light-sleep for the whole transmit-critical block
+#endif
     if (currentMode == 0) generateLFM(sweepDuration, freqMax, ampScale);
     else if (currentMode == 1) generateGeometric(sweepDuration, freqMax, ampScale);
     else generatePhaseCoded(sweepDuration, ampScale);
@@ -541,6 +1047,9 @@ void stepCycle() {
 #else
     transmitBurst();
 #endif
+#if ENABLE_POWER_MGMT
+    pmExitActive();
+#endif
     digitalWrite(ledGreen, LOW);
     stepLog = String("TX #") + cycle + " — " + modeNames[currentMode] + ", " + freqMax + "Hz top, " +
               sweepDuration + "ms, amp=" + ampScale;
@@ -549,9 +1058,31 @@ void stepCycle() {
       ? String("fuzzy re-evaluation -> ") + modeNames[currentMode] +
         " [LFM " + String(lfmScore, 2) + ", Geo " + String(geoScore, 2) + ", Phase " + String(phaseScore, 2) + "]"
       : String("manual override -> ") + modeNames[currentMode];
+#if ENABLE_FUZZY_DIAG
+    fuzzyDiagTrace();
+#endif
   }
 
+#if ENABLE_POWER_MGMT
+  pmLogState(STATE_NAMES[state]);
+#endif
+
   buildAndSendTelemetry(state);
+
+#if ENABLE_REAL_FFT
+  // A separate PROCESS frame right after TRANSMIT — see §3's header comment for why this is a
+  // new, additional step rather than repurposing the (never-real) existing echo fields.
+  if (transmitting) {
+#if ENABLE_POWER_MGMT
+    pmEnterActive();  // compute-bound; benefits from full clock like the transmit path above
+#endif
+    runFftProcessStep();
+#if ENABLE_POWER_MGMT
+    pmExitActive();
+#endif
+    buildAndSendTelemetry(PROCESS);
+  }
+#endif
 }
 
 // ============================== TELEMETRY ===================================
@@ -605,11 +1136,33 @@ void buildAndSendTelemetry(SonarState state) {
   }
 #endif
 
+#if ENABLE_DIAGNOSTICS
+  // §5: optional fields only, gated on this flag — the required fields above are untouched.
+  doc["adapt_time_us"] = (uint32_t)lastAdaptTimeUs;
+#if ENABLE_REAL_FFT
+  if (state == PROCESS) doc["fft_time_us"] = (uint32_t)lastFftTimeUs;
+#endif
+#if ENABLE_CORE_PINNING
+  doc["core0_idle_pct"] = serialized(String(core0IdlePct, 1));
+  doc["core1_idle_pct"] = serialized(String(core1IdlePct, 1));
+#endif
+#if ENABLE_CURRENT_SENSE
+  { float ma = currentSenseReadMa(); if (!isnan(ma)) doc["current_ma"] = serialized(String(ma, 2)); }
+#endif
+#endif  // ENABLE_DIAGNOSTICS
+
   String out;
   serializeJson(doc, out);
   Serial.println(out);  // USB: one JSON object per line
+#if ENABLE_CORE_PINNING
+  if (telemetryOutQueue) {
+    char *copy = strdup(out.c_str());
+    if (copy && xQueueSend(telemetryOutQueue, &copy, 0) != pdTRUE) free(copy);  // full: drop rather than stall core 1
+  }
+#else
   bool wifiUp = wifiEnabled && WiFi.status() == WL_CONNECTED;
   if (wifiUp) postTelemetry(out);
+#endif
 }
 
 void postTelemetry(const String &body) {
@@ -666,6 +1219,12 @@ void applyCommand(JsonObjectConst c) {
   } else if (strcmp(cmd, "trigger_ping") == 0) {
     pingRequested = true;
     Serial.println("# ping requested by host");
+#if ENABLE_FUZZY_DIAG && DIAG_SWEEP_TEST
+  } else if (strcmp(cmd, "sweep_test") == 0) {
+    const char *v = c["input"] | "turbidity";
+    int in = strcmp(v, "depth") == 0 ? SWEEP_DEPTH : strcmp(v, "temperature") == 0 ? SWEEP_TEMPERATURE : SWEEP_TURBIDITY;
+    runSweepTest(in);
+#endif
   } else {
     Serial.printf("# unknown command '%s'\n", cmd);
   }
@@ -721,6 +1280,9 @@ void setupWifi() {
   wifiEnabled = true;
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+#if ENABLE_POWER_MGMT
+  WiFi.setSleep(true);  // modem sleep between the once-per-cycle telemetry sends
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASS);  // non-blocking; loop() reports when it connects
   Serial.printf("# WiFi connecting to '%s', backend %s\n", WIFI_SSID, TELEMETRY_URL.c_str());
 }
@@ -747,6 +1309,18 @@ void setup() {
 #endif
   digitalWrite(ledRed, HIGH);
   Serial.println("# adaptive sonar TX module online — fuzzy mode selection active");
+#if ENABLE_POWER_MGMT
+  pmSetup();
+#if ENABLE_CURRENT_SENSE
+  currentSenseSetup();
+#endif
+#endif
+#if ENABLE_REAL_FFT
+  fftSetup();
+#endif
+#if ENABLE_CORE_PINNING
+  corePinningSetup();  // calibrates idle hooks before WiFi/other load starts, then spawns core 0's task
+#endif
   setupWifi();
   lastTickMs = millis();
 }
@@ -754,6 +1328,9 @@ void setup() {
 void loop() {
   readSerialCommands();
   readButtons();
+#if ENABLE_CORE_PINNING
+  drainQueuedCommands();  // applies anything core0CommsTask queued from its WiFi poll
+#endif
 
   bool wifiUp = wifiEnabled && WiFi.status() == WL_CONNECTED;
   if (wifiUp != wifiWasConnected) {
@@ -763,14 +1340,29 @@ void loop() {
   }
 
   uint32_t now = millis();
+#if !ENABLE_CORE_PINNING
   uint32_t pollEvery = backendReachable ? COMMAND_POLL_MS : BACKOFF_POLL_MS;
   if (wifiUp && now - lastPollMs >= pollEvery) {
     lastPollMs = now;
     pollCommands();
   }
+#endif  // core0CommsTask does this instead when core pinning is on
 
   if (now - lastTickMs >= TICK_MS || pingRequested) {
     lastTickMs = now;
     stepCycle();
   }
+
+#if ENABLE_CORE_PINNING
+  idlePinStatsTick();
+#endif
+
+#if ENABLE_POWER_MGMT
+  // A tight busy-poll loop never lets the FreeRTOS idle task run, so auto light-sleep (armed by
+  // pmSetup()) never actually engages. This 1ms yield is the only place it can — never inside
+  // stepCycle()'s transmit path, which is already complete by the time control reaches here, and
+  // which additionally holds the no-sleep PM lock while it runs (see stepCycle()). 1ms of button/
+  // serial-poll latency is imperceptible against this board's ~1s tick and 50-200ms bursts.
+  delay(1);
+#endif
 }
