@@ -120,7 +120,7 @@
 }
 
 .btnPrimary:hover:not(:disabled) {
-  background: rgba(62, 214, 199, 0.26);
+  background: rgba(11, 138, 128, 0.18);
   border-color: var(--cyan);
 }
 

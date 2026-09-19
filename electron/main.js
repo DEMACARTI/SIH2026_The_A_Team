@@ -77,10 +77,10 @@ function startBackend(port) {
 const LOADING_HTML = `data:text/html,${encodeURIComponent(`
 <!doctype html><html><head><meta charset="utf-8"><title>Starting…</title>
 <style>
-  html,body{height:100%;margin:0;background:#060A10;color:#7C93A1;
+  html,body{height:100%;margin:0;background:#EEF2F5;color:#526675;
     font-family:-apple-system,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center}
   .box{text-align:center}
-  .dot{width:8px;height:8px;border-radius:50%;background:#3ED6C7;display:inline-block;margin:0 3px;
+  .dot{width:8px;height:8px;border-radius:50%;background:#0B8A80;display:inline-block;margin:0 3px;
     animation:pulse 1s ease-in-out infinite}
   .dot:nth-child(2){animation-delay:.15s}.dot:nth-child(3){animation-delay:.3s}
   @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
@@ -96,7 +96,7 @@ async function createWindow() {
     height: 900,
     minWidth: 380,
     minHeight: 560,
-    backgroundColor: '#060A10',
+    backgroundColor: '#EEF2F5',
     title: 'Adaptive Sonar TX — Module Console',
     webPreferences: { contextIsolation: true, nodeIntegration: false },
     show: false,

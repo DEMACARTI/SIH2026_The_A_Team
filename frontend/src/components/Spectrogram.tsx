@@ -2,15 +2,15 @@ import { useEffect, useRef, type ReactNode } from 'react';
 import { useStore } from '../store';
 import p from './panels.module.css';
 
-/** Dark → cyan → white, matching the console's signal accent. Returns [r,g,b]. */
+/** Pale → cyan → deep teal, matching the console's signal accent on a light ground. Returns [r,g,b]. */
 function magnitudeColor(v: number): [number, number, number] {
   const t = v / 255;
   if (t < 0.6) {
     const k = t / 0.6;
-    return [Math.round(6 + k * (62 - 6)), Math.round(10 + k * (214 - 10)), Math.round(16 + k * (199 - 16))];
+    return [Math.round(232 + k * (30 - 232)), Math.round(238 + k * (176 - 238)), Math.round(242 + k * (164 - 242))];
   }
   const k = (t - 0.6) / 0.4;
-  return [Math.round(62 + k * (255 - 62)), Math.round(214 + k * (255 - 214)), Math.round(199 + k * (255 - 199))];
+  return [Math.round(30 + k * (4 - 30)), Math.round(176 + k * (44 - 176)), Math.round(164 + k * (58 - 164))];
 }
 
 /**

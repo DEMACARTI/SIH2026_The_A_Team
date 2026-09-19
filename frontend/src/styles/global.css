@@ -1,28 +1,28 @@
 :root {
-  --bg-deep: #060a10;
-  --bg-panel: #0d141c;
-  --bg-panel-alt: #101922;
-  --bg-inset: #080d13;
-  --border: #1c2a35;
-  --border-bright: #2c4048;
-  --cyan: #3ed6c7;
-  --cyan-dim: #1f6e68;
-  --cyan-faint: rgba(62, 214, 199, 0.16);
-  --amber: #f0a94e;
-  --amber-dim: #8a611f;
-  --amber-faint: rgba(240, 169, 78, 0.16);
-  --text: #e7eef2;
-  --text-muted: #7c93a1;
-  --text-faint: #44586a;
-  --danger: #e2584b;
-  --danger-faint: rgba(226, 88, 75, 0.14);
+  --bg-deep: #eef2f5;
+  --bg-panel: #ffffff;
+  --bg-panel-alt: #f4f7f9;
+  --bg-inset: #e8edf1;
+  --border: #d3dce3;
+  --border-bright: #b2c0ca;
+  --cyan: #0b8a80;
+  --cyan-dim: #8fd3cc;
+  --cyan-faint: rgba(11, 138, 128, 0.1);
+  --amber: #b86a0c;
+  --amber-dim: #e2b878;
+  --amber-faint: rgba(184, 106, 12, 0.12);
+  --text: #14202a;
+  --text-muted: #526675;
+  --text-faint: #7d909e;
+  --danger: #c8372b;
+  --danger-faint: rgba(200, 55, 43, 0.1);
 
   --sans: 'IBM Plex Sans', system-ui, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
   --radius: 2px;
   --gutter: 20px;
 
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 @media (max-width: 767px) {
@@ -86,7 +86,7 @@ button:disabled {
 /* Value-change flash on readouts — disabled for reduced motion below. */
 @keyframes flash {
   from {
-    background: rgba(231, 238, 242, 0.1);
+    background: rgba(20, 32, 42, 0.08);
   }
   to {
     background: transparent;
